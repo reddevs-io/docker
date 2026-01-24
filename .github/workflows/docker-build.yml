@@ -160,12 +160,19 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Prepare sanitized image name
+        id: sanitize
+        run: |
+          # Replace slashes with hyphens for file paths
+          SANITIZED_NAME=$(echo "${{ matrix.image }}" | sed 's/\//-/g')
+          echo "name=$SANITIZED_NAME" >> $GITHUB_OUTPUT
+
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@master
         with:
           image-ref: ${{ matrix.image }}:latest
           format: 'sarif'
-          output: 'trivy-results-${{ matrix.image }}.sarif'
+          output: 'trivy-results-${{ steps.sanitize.outputs.name }}.sarif'
           severity: 'HIGH,CRITICAL'
           exit-code: '0'  # Don't fail here, we'll check in next step
           ignore-unfixed: true
@@ -176,8 +183,8 @@ jobs:
         uses: github/codeql-action/upload-sarif@v3
         if: always()
         with:
-          sarif_file: 'trivy-results-${{ matrix.image }}.sarif'
-          category: 'trivy-${{ matrix.image }}'
+          sarif_file: 'trivy-results-${{ steps.sanitize.outputs.name }}.sarif'
+          category: 'trivy-${{ steps.sanitize.outputs.name }}'
 
       - name: Run Trivy vulnerability scanner (table output)
         id: trivy-scan
