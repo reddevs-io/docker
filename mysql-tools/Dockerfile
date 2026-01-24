@@ -1,6 +1,8 @@
 # Use Alpine Linux as the base image
 FROM alpine:3.23
 
+LABEL version="1.0.0"
+
 # Install mysql-client package which includes both mysql and mysqldump
 RUN apk add --no-cache mysql-client
 
