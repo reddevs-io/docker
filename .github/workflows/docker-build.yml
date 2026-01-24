@@ -1,0 +1,250 @@
+name: Build and Push Docker Images with Security Scanning
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+    paths:
+      - '**/Dockerfile'
+      - '.github/workflows/docker-build.yml'
+  pull_request:
+    branches:
+      - main
+      - develop
+    paths:
+      - '**/Dockerfile'
+      - '.github/workflows/docker-build.yml'
+  workflow_dispatch:
+
+# GitHub Secrets Required:
+# - DOCKERHUB_USERNAME: Your Docker Hub username
+# - DOCKERHUB_TOKEN: Your Docker Hub access token (not password)
+
+env:
+  # Set to 'true' to push images even on PR (default: only push on push to main/master/develop)
+  PUSH_ON_PR: false
+
+jobs:
+  # Job 1: Detect which Dockerfiles have changed
+  detect-changes:
+    name: Detect Changed Dockerfiles
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      has-changes: ${{ steps.set-matrix.outputs.has-changes }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch all history for accurate diff
+
+      - name: Detect changed Dockerfiles
+        id: set-matrix
+        run: |
+          # Define all possible Dockerfiles with their metadata
+          declare -A dockerfiles=(
+            ["kube-linter/Dockerfile"]="kube-linter:reddevsdotio/kube-linter"
+            ["mysql-tools/Dockerfile"]="mysql-tools:reddevsdotio/mysql-tools"
+            ["opentofu/Dockerfile"]="opentofu:reddevsdotio/opentofu"
+            ["postgres-tools/Dockerfile"]="postgres-tools:reddevsdotio/postgres-tools"
+            ["unit/php-8.3/Dockerfile"]="unit/php-8.3:reddevsdotio/unit-php-8.3"
+            ["unit/php-8.4/Dockerfile"]="unit/php-8.4:reddevsdotio/unit-php-8.4"
+          )
+
+          # Determine base commit for diff
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          elif [ "${{ github.event_name }}" == "push" ]; then
+            # For push events, compare with previous commit
+            BASE_SHA="${{ github.event.before }}"
+            # If this is the first commit, use HEAD
+            if [ "$BASE_SHA" == "0000000000000000000000000000000000000000" ]; then
+              BASE_SHA="HEAD"
+            fi
+          else
+            # For workflow_dispatch or other events, build all
+            BASE_SHA=""
+          fi
+
+          # Get changed files
+          if [ -n "$BASE_SHA" ] && [ "$BASE_SHA" != "HEAD" ]; then
+            CHANGED_FILES=$(git diff --name-only "$BASE_SHA" "${{ github.sha }}" | grep -E 'Dockerfile$' || true)
+          else
+            # Build all Dockerfiles for manual triggers or first commit
+            CHANGED_FILES=$(printf '%s\n' "${!dockerfiles[@]}")
+          fi
+
+          echo "Changed files:"
+          echo "$CHANGED_FILES"
+
+          # Build JSON matrix
+          matrix_include="["
+          first=true
+
+          for dockerfile in "${!dockerfiles[@]}"; do
+            if echo "$CHANGED_FILES" | grep -q "^${dockerfile}$"; then
+              IFS=':' read -r context image_name <<< "${dockerfiles[$dockerfile]}"
+              
+              if [ "$first" = true ]; then
+                first=false
+              else
+                matrix_include+=","
+              fi
+              
+              matrix_include+="{\"dockerfile\":\"${dockerfile}\",\"context\":\"${context}\",\"image\":\"${image_name}\"}"
+            fi
+          done
+
+          matrix_include+="]"
+
+          # Check if we have any changes
+          if [ "$matrix_include" == "[]" ]; then
+            echo "has-changes=false" >> $GITHUB_OUTPUT
+            echo "matrix={\"include\":[]}" >> $GITHUB_OUTPUT
+            echo "No Dockerfile changes detected"
+          else
+            echo "has-changes=true" >> $GITHUB_OUTPUT
+            echo "matrix={\"include\":$matrix_include}" >> $GITHUB_OUTPUT
+            echo "Matrix: {\"include\":$matrix_include}"
+          fi
+
+  # Job 2: Build, scan, and push Docker images
+  build-and-push:
+    name: Build ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.has-changes == 'true'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
+    
+    permissions:
+      contents: read
+      security-events: write  # For uploading Trivy results to GitHub Security tab
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        if: github.event_name != 'pull_request' || env.PUSH_ON_PR == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ matrix.image }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: false
+          load: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ matrix.image }}:latest
+          format: 'sarif'
+          output: 'trivy-results-${{ matrix.image }}.sarif'
+          severity: 'HIGH,CRITICAL'
+          exit-code: '0'  # Don't fail here, we'll check in next step
+          ignore-unfixed: true
+          scanners: 'vuln,secret'
+          timeout: '10m'
+
+      - name: Upload Trivy results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results-${{ matrix.image }}.sarif'
+          category: 'trivy-${{ matrix.image }}'
+
+      - name: Run Trivy vulnerability scanner (table output)
+        id: trivy-scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ matrix.image }}:latest
+          format: 'table'
+          severity: 'HIGH,CRITICAL'
+          exit-code: '1'  # Fail on CRITICAL vulnerabilities
+          ignore-unfixed: true
+          scanners: 'vuln,secret'
+          timeout: '10m'
+        continue-on-error: true
+
+      - name: Check Trivy scan results
+        id: check-scan
+        run: |
+          if [ "${{ steps.trivy-scan.outcome }}" == "failure" ]; then
+            echo "::error::Trivy scan found CRITICAL vulnerabilities in ${{ matrix.image }}"
+            echo "scan-passed=false" >> $GITHUB_OUTPUT
+            exit 1
+          else
+            echo "::notice::Trivy scan passed for ${{ matrix.image }}"
+            echo "scan-passed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Push Docker image to Docker Hub
+        if: |
+          steps.check-scan.outputs.scan-passed == 'true' && 
+          (github.event_name != 'pull_request' || env.PUSH_ON_PR == 'true')
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Image digest
+        if: steps.check-scan.outputs.scan-passed == 'true'
+        run: |
+          echo "Image tags pushed:"
+          echo "${{ steps.meta.outputs.tags }}"
+
+  # Job 3: Summary report
+  build-summary:
+    name: Build Summary
+    runs-on: ubuntu-latest
+    needs: [detect-changes, build-and-push]
+    if: always()
+    steps:
+      - name: Generate summary
+        run: |
+          echo "## Docker Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ needs.detect-changes.outputs.has-changes }}" == "true" ]; then
+            echo "✅ Changed Dockerfiles detected and processed" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Build Status:** ${{ needs.build-and-push.result }}" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "ℹ️ No Dockerfile changes detected - skipped build" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Event:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
