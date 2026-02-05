@@ -40,13 +40,20 @@ jobs:
         id: set-matrix
         run: |
           # Define all possible Dockerfiles with their metadata
+          # Format: "context:image_name:custom_tag" (custom_tag is optional)
           declare -A dockerfiles=(
             ["kube-linter/Dockerfile"]="kube-linter:reddevsdotio/kube-linter"
             ["mysql-tools/Dockerfile"]="mysql-tools:reddevsdotio/mysql-tools"
             ["opentofu/Dockerfile"]="opentofu:reddevsdotio/opentofu"
+            ["php/8.3/apache/Dockerfile"]="php/8.3/apache:reddevsdotio/php:8.3-apache"
+            ["php/8.3/fpm/Dockerfile"]="php/8.3/fpm:reddevsdotio/php:8.3-fpm"
+            ["php/8.4/apache/Dockerfile"]="php/8.4/apache:reddevsdotio/php:8.4-apache"
+            ["php/8.4/fpm/Dockerfile"]="php/8.4/fpm:reddevsdotio/php:8.4-fpm"
+            ["php/8.5/apache/Dockerfile"]="php/8.5/apache:reddevsdotio/php:8.5-apache"
+            ["php/8.5/fpm/Dockerfile"]="php/8.5/fpm:reddevsdotio/php:8.5-fpm"
             ["postgres-tools/Dockerfile"]="postgres-tools:reddevsdotio/postgres-tools"
-            ["unit/php-8.3/Dockerfile"]="unit/php-8.3:reddevsdotio/unit-php-8.3"
-            ["unit/php-8.4/Dockerfile"]="unit/php-8.4:reddevsdotio/unit-php-8.4"
+            ["unit/php-8.3/Dockerfile"]="unit/php-8.3:reddevsdotio/unit:php-8.3"
+            ["unit/php-8.4/Dockerfile"]="unit/php-8.4:reddevsdotio/unit:php-8.4"
           )
 
           # Determine base commit for diff
@@ -81,7 +88,8 @@ jobs:
 
           for dockerfile in "${!dockerfiles[@]}"; do
             if echo "$CHANGED_FILES" | grep -q "^${dockerfile}$"; then
-              IFS=':' read -r context image_name <<< "${dockerfiles[$dockerfile]}"
+              # Parse the metadata - supports both "context:image" and "context:image:tag" formats
+              IFS=':' read -r context image_name custom_tag <<< "${dockerfiles[$dockerfile]}"
               
               if [ "$first" = true ]; then
                 first=false
@@ -89,7 +97,12 @@ jobs:
                 matrix_include+=","
               fi
               
-              matrix_include+="{\"dockerfile\":\"${dockerfile}\",\"context\":\"${context}\",\"image\":\"${image_name}\"}"
+              # Include custom_tag in matrix if present
+              if [ -n "$custom_tag" ]; then
+                matrix_include+="{\"dockerfile\":\"${dockerfile}\",\"context\":\"${context}\",\"image\":\"${image_name}\",\"tag\":\"${custom_tag}\"}"
+              else
+                matrix_include+="{\"dockerfile\":\"${dockerfile}\",\"context\":\"${context}\",\"image\":\"${image_name}\",\"tag\":\"\"}"
+              fi
             fi
           done
 
@@ -124,6 +137,18 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Extract version from Dockerfile
+        id: extract-version
+        run: |
+          # Extract version label from Dockerfile
+          VERSION=$(grep -oP 'LABEL version="\K[^"]+' ${{ matrix.dockerfile }} || echo "")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          if [ -n "$VERSION" ]; then
+            echo "Extracted version: $VERSION"
+          else
+            echo "No version label found in Dockerfile"
+          fi
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -140,10 +165,10 @@ jobs:
         with:
           images: ${{ matrix.image }}
           tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=sha,prefix={{branch}}-
-            type=raw,value=latest,enable={{is_default_branch}}
+            ${{ matrix.tag != '' && format('type=raw,value={0}', matrix.tag) || (steps.extract-version.outputs.version != '' && format('type=raw,value={0}', steps.extract-version.outputs.version) || 'type=ref,event=branch') }}
+            ${{ matrix.tag == '' && steps.extract-version.outputs.version == '' && 'type=ref,event=pr' || '' }}
+            ${{ matrix.tag == '' && steps.extract-version.outputs.version == '' && 'type=sha,prefix={{branch}}-' || '' }}
+            ${{ matrix.tag == '' && steps.extract-version.outputs.version == '' && 'type=raw,value=latest,enable={{is_default_branch}}' || '' }}
 
       - name: Build Docker image
         uses: docker/build-push-action@v5
@@ -163,11 +188,21 @@ jobs:
           # Replace slashes with hyphens for file paths
           SANITIZED_NAME=$(echo "${{ matrix.image }}" | sed 's/\//-/g')
           echo "name=$SANITIZED_NAME" >> $GITHUB_OUTPUT
+          
+          # Determine the image reference for scanning
+          if [ -n "${{ matrix.tag }}" ]; then
+            IMAGE_REF="${{ matrix.image }}:${{ matrix.tag }}"
+          elif [ -n "${{ steps.extract-version.outputs.version }}" ]; then
+            IMAGE_REF="${{ matrix.image }}:${{ steps.extract-version.outputs.version }}"
+          else
+            IMAGE_REF="${{ matrix.image }}:latest"
+          fi
+          echo "image-ref=$IMAGE_REF" >> $GITHUB_OUTPUT
 
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: ${{ matrix.image }}:latest
+          image-ref: ${{ steps.sanitize.outputs.image-ref }}
           format: 'sarif'
           output: 'trivy-results-${{ steps.sanitize.outputs.name }}.sarif'
           severity: 'HIGH,CRITICAL'
@@ -187,7 +222,7 @@ jobs:
         id: trivy-scan
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: ${{ matrix.image }}:latest
+          image-ref: ${{ steps.sanitize.outputs.image-ref }}
           format: 'table'
           severity: 'HIGH,CRITICAL'
           exit-code: '1'  # Fail on CRITICAL vulnerabilities
