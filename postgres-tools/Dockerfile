@@ -1,6 +1,6 @@
 FROM alpine:3.23
 
-LABEL version="1.0.0"
+LABEL version="1.0.1"
 
 RUN apk add --no-cache postgresql-client bash nano
 

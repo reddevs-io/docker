@@ -1,7 +1,7 @@
 # Builder stage
 FROM golang:1-alpine AS builder
 
-LABEL version="1.0.0"
+LABEL version="1.0.1"
 
 # Install necessary tools for building
 RUN apk add --no-cache curl bash openssl

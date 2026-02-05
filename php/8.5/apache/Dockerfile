@@ -30,11 +30,7 @@ RUN set -eux; \
 	\
 	# Configure and install PHP extensions
 	docker-php-ext-configure gd --with-freetype --with-jpeg --with-webp; \
-	docker-php-ext-install -j "$(nproc)" gd opcache pdo_mysql pdo_pgsql zip; \
-	\
-	# Install PECL extensions
-	pecl install apcu redis uploadprogress; \
-	docker-php-ext-enable apcu redis uploadprogress; \
+	docker-php-ext-install -j "$(nproc)" gd zip; \
 	\
 	# --- Cleanup ---
 	# This removes build dependencies and cleans apt cache
