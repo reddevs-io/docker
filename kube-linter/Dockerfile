@@ -16,10 +16,9 @@ RUN curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/s
   mv kubectl /usr/local/bin/
 
 # Install helm
-RUN curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 && \
-  chmod 700 get_helm.sh && \
-  VERIFY_CHECKSUM=false ./get_helm.sh && \
-  rm get_helm.sh
+RUN curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-4
+    chmod 700 get_helm.sh
+    ./get_helm.sh
 
 # Final stage
 FROM alpine:3
