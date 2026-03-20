@@ -1,19 +1,24 @@
 # Builder stage
 FROM golang:1-alpine AS builder
 
-LABEL version="1.0.1"
+LABEL version="1.0.3"
 
 # Install necessary tools for building
-RUN apk add --no-cache curl bash openssl
+RUN apk upgrade && \
+  apk add --no-cache curl bash openssl git
 
-# Install kube-linter
-RUN GO111MODULE=on go install golang.stackrox.io/kube-linter/cmd/kube-linter@latest && \
-  mv /go/bin/kube-linter /usr/local/bin/kube-linter
+# Install kube-linter (clone source and force grpc >= v1.79.3 to remediate CVE-2026-33186)
+RUN git clone https://github.com/stackrox/kube-linter.git /tmp/kube-linter && \
+  cd /tmp/kube-linter && \
+  go get google.golang.org/grpc@v1.79.3 && \
+  go mod tidy && \
+  go build -o /usr/local/bin/kube-linter ./cmd/kube-linter/
 
-# Install kubectl
-RUN curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" && \
-  chmod +x kubectl && \
-  mv kubectl /usr/local/bin/
+# Install kubectl (built from source to ensure Go stdlib CVEs are patched)
+ENV KUBECTL_VERSION=v1.35.0
+RUN git clone --depth 1 --branch ${KUBECTL_VERSION} https://github.com/kubernetes/kubernetes.git /tmp/kubernetes && \
+  cd /tmp/kubernetes && \
+  go build -o /usr/local/bin/kubectl ./cmd/kubectl/
 
 # Install helm
 RUN curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-4 && \
@@ -22,6 +27,9 @@ RUN curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/s
 
 # Final stage
 FROM alpine:3
+
+# Upgrade OS packages to patch known CVEs (e.g. zlib CVE-2026-22184, CVE-2026-27171)
+RUN apk upgrade --no-cache
 
 # Copy the installed binaries from the builder stage
 COPY --from=builder /usr/local/bin/kube-linter /usr/local/bin/kube-linter
